@@ -6,8 +6,13 @@
  *   列表  解析 ShowCard 卡片 (首頁各列、/browse、/collections/N、/search/關鍵字)
  *   分頁  以分頁列的「目前頁」判斷該頁是否存在 (沒有分頁的合輯會對任何頁碼回傳第 1 頁)
  *   詳情  SeriesHero 區塊 + Next.js __next_f payload 內的 initialEpisodes
- *   播放  播放頁的 Brightcove account/player → policy key → Playback API → HLS
+ *   播放  播放頁的 Brightcove account/player → policy key → Playback API
  *         (policy key 綁定網域，請求必須帶 TVB 的 Origin/Referer)
+ *
+ * 每部劇有兩條線路：
+ *   TVB 粵語    1080p MP4，只有主聲道 (粵語)，與 Python 端實際播放的檔案相同
+ *   TVB 多聲道  HLS，自動調整畫質，帶粵語／國語／越語聲道 (有哪些視該劇而定)，
+ *               由播放器選擇，中文裝置通常會先選到國語
  *
  * 上游只開放美國／加拿大 IP (regionsAllowed: US,CA)，播放裝置本身必須在該地區。
  *
@@ -26,6 +31,8 @@ var TVB = (function () {
     var UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
     // 播放頁找不到 Brightcove 內嵌資訊時的後備值
     var BC_ACCOUNT = '5324042807001', BC_PLAYER = 't3oBfbU6IW_default';
+    // 多聲道線路的集數網址帶這個記號，play() 據此改選 HLS
+    var HLS_MARK = '?hls=1';
 
     function get(url, headers) {
         try {
@@ -262,8 +269,8 @@ var TVB = (function () {
             vod_director: '',
             // hero 裡的簡介被截斷，完整版在下方的 About 區塊
             vod_content: text(inner(html, 'AboutSection', 'synopsis')) || text(inner(hero, 'SeriesHero', 'synopsis')),
-            vod_play_from: 'TVB Anywhere',
-            vod_play_url: plays.join('#')
+            vod_play_from: 'TVB 粵語$$$TVB 多聲道',
+            vod_play_url: plays.length ? plays.join('#') + '$$$' + plays.join(HLS_MARK + '#') + HLS_MARK : ''
         };
     }
 
@@ -315,11 +322,15 @@ var TVB = (function () {
         return null;
     }
 
-    function pickSource(data) {
+    // 預設與 Python 端 (yt-dlp 的預設選擇) 一致：優先用漸進式 MP4，它只有主聲道 (粵語)。
+    // HLS/DASH 同時帶粵語、國語、越語聲道，雖然標了粵語為預設，
+    // 但播放器多半依裝置語系挑選，中文裝置會選到國語配音，所以只在多聲道線路才優先。
+    function pickSource(data, multi) {
         var best = '', bestScore = -1;
         data.sources.forEach(function (s) {
             if (!s || !s.src) return;
-            var score = /mpegurl/i.test(s.type || '') ? 30 : /dash/i.test(s.type || '') ? 20 : 10;
+            var score = /mpegurl/i.test(s.type || '') ? (multi ? 40 : 20) : /dash/i.test(s.type || '') ? 10
+                : /mp4/i.test(s.container || '') ? 30 + (s.avg_bitrate || 0) / 1e9 : 0;
             if (/^https:/.test(s.src)) score += 5;
             if (s.key_systems) score -= 100;
             if (score > bestScore) {
@@ -331,6 +342,8 @@ var TVB = (function () {
     }
 
     function play(url) {
+        var multi = url.indexOf(HLS_MARK) >= 0;
+        url = url.split('?')[0];
         // 解析不到直連時交給播放器嗅探播放頁
         var sniff = {parse: 1, jx: 0, url: url};
         try {
@@ -346,7 +359,7 @@ var TVB = (function () {
                 player = 'default_default';
             }
             var data = playback(account, player, video);
-            var src = data ? pickSource(data) : '';
+            var src = data ? pickSource(data, multi) : '';
             return src ? {parse: 0, jx: 0, url: src} : sniff;
         } catch (e) {
             return sniff;
