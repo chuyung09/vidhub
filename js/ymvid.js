@@ -8,7 +8,8 @@
  *   搜尋  /hk/search?keyword=關鍵字&p=頁，只取 .search-list 裡的 .item-row
  *   詳情  /hk/play/{id} 的 .media-info、.type-row、.intro-detail 與 .play-list 選集
  *   播放  與 canton-anime 的 ymvid.py 相同的 XXTEA 解密：解開選集的 data-play-url、
- *         取 /allocate/secure_key，組出 HLS 播放清單直連 (parse: 0)；
+ *         取 /allocate/secure_key 並取回 HLS 清單 (清單網址只能用一次)，
+ *         經 drpy 本地代理 (proxy_rule) 交給播放器 (parse: 0)；
  *         解不出來時才退回播放頁網址交給 App 嗅探 (parse: 1，sniffer / isVideo)
  *
  * 來源站對訪客只開放列表與搜尋的第 1–4 頁，第 5 頁起會被導去登入頁 (此時回傳空列表)。
@@ -403,15 +404,44 @@ var YM = (function () {
         return xxteaDecrypt(body.data);
     }
 
-    // 解出某一集的 HLS 播放清單網址與播放時要帶的標頭；拿不到回傳 null
-    function resolve(url) {
-        var src = episodeSource(get(abs(url)));
-        if (!src) return null;
+    // 播放清單網址是一次性的：同一個網址第二次 GET 就回 403，而且沒有 .m3u8 副檔名、
+    // content-type 是 text/plain。App 與播放器常會對同一網址請求不只一次 (探測格式、
+    // 去廣告、重試)，直接把網址交給播放器會播不了。所以和 canton-anime 一樣由這裡取回
+    // 清單內容，再經 drpy 本地代理 (proxy_rule) 以 m3u8 的 MIME 提供給播放器。
+    // 清單內容快取 60 秒 (同 canton-anime 的 YMVID_MANIFEST_TTL)，掛在全域物件上，
+    // 讓 lazy 取到的內容能直接給 proxy 用；拿不到快取時 proxy 會自己重新解析。
+    var TTL = 60000;
+    var ROOT = typeof globalThis !== 'undefined' ? globalThis : this;
+    var CACHE = ROOT.__ymvidM3u8 || (ROOT.__ymvidM3u8 = {});
+
+    // 清單裡若有相對路徑 (目前都是 CDN 絕對網址)，以清單網址補成絕對網址
+    function absolutize(m3u8, base) {
+        var origin = /^https?:\/\/[^\/]+/.exec(base)[0], dir = base.split('?')[0].replace(/[^\/]*$/, '');
+        return m3u8.split(/\r?\n/).map(function (line) {
+            if (!line || line.charAt(0) === '#' || /^https?:/.test(line)) return line;
+            return line.charAt(0) === '/' ? origin + line : dir + line;
+        }).join('\n');
+    }
+
+    // 某一集的 HLS 清單內容 (scraper.py fetch_m3u8)；拿不到回傳空字串
+    function manifest(url) {
+        url = abs(url);
+        var hit = CACHE[url];
+        if (hit && hit.exp > Date.now()) return hit.text;
+
+        var src = episodeSource(get(url));
+        if (!src) return '';
         var path = xxteaDecrypt(src.enc).split('?t=')[0];
-        if (path.indexOf('/allocate/') < 0) return null;
+        if (path.indexOf('/allocate/') < 0) return '';
         var code = browserCode();
         var key = secureKey(code);
-        // 播放器送出的開播回報；不送也能拿到完整清單，失敗不影響播放
+        var list = SITE + path + '?t=' + encodeURIComponent(key) + '&vId=' + src.videoId;
+        // hls.js 取清單時只帶 cookie
+        var text = request(list, {headers: {'User-Agent': UA, 'Referer': url, 'Cookie': 'browser-code-v1=' + code}}) || '';
+        if (!/^\s*#EXTM3U/.test(text)) return '';
+        text = absolutize(text, list);
+
+        // 播放器開播後的回報；不送也能拿到完整清單，失敗不影響播放
         try {
             request(SITE + '/video/check_play_status', {
                 method: 'POST',
@@ -420,25 +450,52 @@ var YM = (function () {
             });
         } catch (e) {
         }
-        return {
-            url: SITE + path + '?t=' + encodeURIComponent(key) + '&vId=' + src.videoId,
-            // hls.js 取清單時只帶 cookie；分段在公開 CDN 上，不能帶 Referer (舊 CDN 有防盜鏈)
-            header: {'User-Agent': UA, 'Cookie': 'browser-code-v1=' + code}
-        };
+
+        Object.keys(CACHE).forEach(function (k) {
+            if (CACHE[k].exp <= Date.now()) delete CACHE[k];
+        });
+        CACHE[url] = {exp: Date.now() + TTL, text: text};
+        return text;
     }
 
-    // 先自行解密取得播放清單直連；解不出來時退回交給 App 嗅探播放頁
+    // 解得出清單就交給播放器本地代理網址；解不出來時退回交給 App 嗅探播放頁
     function play(url) {
         try {
-            var real = resolve(url);
-            if (real) return {parse: 0, jx: 0, url: real.url, header: JSON.stringify(real.header)};
+            if (manifest(url)) {
+                return {
+                    parse: 0,
+                    jx: 0,
+                    // 結尾的 .m3u8 讓只看網址判斷格式的播放器把它當 HLS
+                    url: getProxyUrl() + '&url=' + encodeURIComponent(abs(url)) + '&ext=.m3u8',
+                    format: 'application/x-mpegURL'
+                };
+            }
         } catch (e) {
             log('粵漫之家 解密取片失敗，改用嗅探: ' + e.message);
         }
         return {parse: 1, jx: 0, url: url};
     }
 
-    return {home: home, category: category, search: search, detail: detail, play: play};
+    // proxy_rule：/proxy?do=js&url=<播放頁> → [狀態碼, MIME, 清單內容]
+    function proxy(params) {
+        var url = String((params || {}).url || '');
+        if (!/^https?:/.test(url)) {
+            try {
+                url = decodeURIComponent(url);
+            } catch (e) {
+            }
+        }
+        if (!/^https:\/\/ymvid\.com\//.test(url)) return [403, 'text/plain', 'Forbidden'];
+        var text = '';
+        try {
+            text = manifest(url);
+        } catch (e) {
+            return [502, 'text/plain', 'ymvid: ' + e.message];
+        }
+        return text ? [200, 'application/vnd.apple.mpegurl', text] : [404, 'text/plain', 'Not Found'];
+    }
+
+    return {home: home, category: category, search: search, detail: detail, play: play, proxy: proxy};
 })();
 `;
 
@@ -512,6 +569,8 @@ var rule = {
     filter: YM_FILTER,
     play_parse: true,
     lazy: 'js:' + YM_LIB + 'input = YM.play(input);',
+    // lazy 回傳的本地代理網址由這裡提供 HLS 清單內容
+    proxy_rule: 'js:' + YM_LIB + 'input = YM.proxy(input);',
     // 嗅探只是後備：lazy 解不出直連時才回傳播放頁 (parse: 1) 交給 App 嗅探。
     // 播放頁一載入，站方播放器就會自己請求 HLS 清單 /allocate/playlist/…，但這個網址沒有
     // .m3u8 副檔名，只認副檔名的預設嗅探抓不到 (.ts 分段要按下播放才會出現)，
