@@ -7,8 +7,9 @@
  *   列表  /hk/list/{頁}/c{語言}-s{狀態}-v{版本}-l{字母}-t{題材}-y{年份}/{排序}
  *   搜尋  /hk/search?keyword=關鍵字&p=頁，只取 .search-list 裡的 .item-row
  *   詳情  /hk/play/{id} 的 .media-info、.type-row、.intro-detail 與 .play-list 選集
- *   播放  不在這裡解析影片來源，回傳播放頁網址交給 App 嗅探 (parse: 1)；
- *         以 sniffer / isVideo 告訴 App 播放頁發出的哪個請求是 HLS 清單
+ *   播放  與 canton-anime 的 ymvid.py 相同的 XXTEA 解密：解開選集的 data-play-url、
+ *         取 /allocate/secure_key，組出 HLS 播放清單直連 (parse: 0)；
+ *         解不出來時才退回播放頁網址交給 App 嗅探 (parse: 1，sniffer / isVideo)
  *
  * 來源站對訪客只開放列表與搜尋的第 1–4 頁，第 5 頁起會被導去登入頁 (此時回傳空列表)。
  * 想看更後面的內容請用篩選 (年份／題材／字母) 把範圍縮小。
@@ -223,8 +224,217 @@ var YM = (function () {
         };
     }
 
-    // 不解析影片來源，交給 App 嗅探播放頁
+    // ---------------------------------------------------------------------
+    // 取片：與 canton-anime 的 ymvid.py / scraper.py fetch_m3u8 相同的 XXTEA 流程
+    //   1. 播放頁 .play-list 每集 <li> 的 data-play-url 是 XXTEA 密文，解開得到
+    //      /allocate/playlist/<HASH>?t=…，只取 path
+    //   2. GET /allocate/secure_key，回應 data 以 XXTEA 解開即為這次的 secure key
+    //   3. 播放清單 = SITE + path + ?t=<secureKey>&vId=<#main data-id>
+    //   4. XHR 帶 X-Client-Type: web 與 Browser-Code (= browser-code-v1 cookie)，
+    //      值是 XXTEA("<visitorId>_<UTC yyyy-MM-dd>")
+    // 金鑰寫死在來源站帶版本號的 xxtea.js / script.js / detail-play.js；播放壞了先回去對照。
+    // ---------------------------------------------------------------------
+    var XXTEA_KEY = 'RuoYi_XXTEA_Key1';
+    var DELTA = 0x9E3779B9;
+    // md5('canton-anime')：固定的 32 位 hex visitorId，與 canton-anime 送出相同的 code
+    var VISITOR_ID = 'f0b8a02182d6738d553138ac0b7d838b';
+    var UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+    var B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+
+    function utf8Bytes(str) {
+        var bin = unescape(encodeURIComponent(str)), out = [];
+        for (var i = 0; i < bin.length; i++) out.push(bin.charCodeAt(i));
+        return out;
+    }
+
+    function utf8String(bytes) {
+        var bin = '';
+        for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+        return decodeURIComponent(escape(bin));
+    }
+
+    // base64url，不補 =
+    function b64urlEncode(bytes) {
+        var out = '';
+        for (var i = 0; i < bytes.length; i += 3) {
+            var n = (bytes[i] << 16) | ((bytes[i + 1] || 0) << 8) | (bytes[i + 2] || 0);
+            out += B64.charAt(n >> 18 & 63) + B64.charAt(n >> 12 & 63);
+            if (i + 1 < bytes.length) out += B64.charAt(n >> 6 & 63);
+            if (i + 2 < bytes.length) out += B64.charAt(n & 63);
+        }
+        return out;
+    }
+
+    // 同時接受 base64url 與標準 base64，有無 padding 皆可
+    function b64urlDecode(str) {
+        str = String(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/[=\s]/g, '');
+        var out = [], buf = 0, bits = 0;
+        for (var i = 0; i < str.length; i++) {
+            var v = B64.indexOf(str.charAt(i));
+            if (v < 0) throw new Error('XXTEA: bad base64');
+            buf = (buf << 6) | v;
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                out.push((buf >> bits) & 255);
+            }
+        }
+        return out;
+    }
+
+    function toWords(bytes, withLength) {
+        var n = Math.ceil(bytes.length / 4), words = [];
+        for (var i = 0; i < n; i++) {
+            words.push(((bytes[i * 4] || 0) | ((bytes[i * 4 + 1] || 0) << 8) |
+                ((bytes[i * 4 + 2] || 0) << 16) | ((bytes[i * 4 + 3] || 0) << 24)) >>> 0);
+        }
+        if (withLength) words.push(bytes.length);
+        return words;
+    }
+
+    function fromWords(words, withLength) {
+        var size = words.length * 4, out = [];
+        if (withLength) {
+            var real = words[words.length - 1];
+            size -= 4;
+            if (real < size - 3 || real > size) throw new Error('XXTEA: bad length word');
+            size = real;
+        }
+        for (var i = 0; i < size; i++) out.push((words[i >> 2] >>> ((i & 3) * 8)) & 255);
+        return out;
+    }
+
+    function mx(sum, y, z, p, e, k) {
+        return ((((z >>> 5) ^ (y << 2)) + ((y >>> 3) ^ (z << 4))) ^ ((sum ^ y) + (k[(p & 3) ^ e] ^ z))) >>> 0;
+    }
+
+    function encryptWords(v, k) {
+        var n = v.length - 1;
+        if (n < 1) return v;
+        var z = v[n], y, sum = 0, e, p, q = Math.floor(6 + 52 / (n + 1));
+        while (q-- > 0) {
+            sum = (sum + DELTA) >>> 0;
+            e = (sum >>> 2) & 3;
+            for (p = 0; p < n; p++) {
+                y = v[p + 1];
+                z = v[p] = (v[p] + mx(sum, y, z, p, e, k)) >>> 0;
+            }
+            y = v[0];
+            z = v[n] = (v[n] + mx(sum, y, z, n, e, k)) >>> 0;
+        }
+        return v;
+    }
+
+    function decryptWords(v, k) {
+        var n = v.length - 1;
+        if (n < 1) return v;
+        var y = v[0], z, e, p, sum = (Math.floor(6 + 52 / (n + 1)) * DELTA) >>> 0;
+        while (sum !== 0) {
+            e = (sum >>> 2) & 3;
+            for (p = n; p > 0; p--) {
+                z = v[p - 1];
+                y = v[p] = (v[p] - mx(sum, y, z, p, e, k)) >>> 0;
+            }
+            z = v[n];
+            y = v[0] = (v[0] - mx(sum, y, z, 0, e, k)) >>> 0;
+            sum = (sum - DELTA) >>> 0;
+        }
+        return v;
+    }
+
+    // xxtea.js XXTEAUtils.encrypt：UTF-8 → XXTEA (長度附在最後一個 word) → base64url
+    function xxteaEncrypt(plain) {
+        if (!plain) return '';
+        var words = encryptWords(toWords(utf8Bytes(plain), true), toWords(utf8Bytes(XXTEA_KEY), false));
+        return b64urlEncode(fromWords(words, false));
+    }
+
+    function xxteaDecrypt(token) {
+        if (!token) return '';
+        var words = decryptWords(toWords(b64urlDecode(token), false), toWords(utf8Bytes(XXTEA_KEY), false));
+        return utf8String(fromWords(words, true));
+    }
+
+    function pad2(n) {
+        return (n < 10 ? '0' : '') + n;
+    }
+
+    // script.js getBrowserCode；每次重算讓日期保持在當天 (UTC)
+    function browserCode() {
+        var d = new Date();
+        return xxteaEncrypt(VISITOR_ID + '_' + d.getUTCFullYear() + '-' + pad2(d.getUTCMonth() + 1) + '-' + pad2(d.getUTCDate()));
+    }
+
+    // http.js sendRequest 對每個 XHR 加的標頭
+    function xhrHeaders(code) {
+        return {
+            'User-Agent': UA,
+            'Referer': HOME,
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'X-Client-Type': 'web',
+            'Browser-Code': code,
+            'Cookie': 'browser-code-v1=' + code
+        };
+    }
+
+    // #main 的 data-id (videoId)、目前這集的 data-series-id 與它的 data-play-url 密文
+    function episodeSource(html) {
+        var main = (/<\w+\b[^>]*\sid="main"[^>]*>/.exec(html) || [''])[0];
+        var videoId = attr(main, 'data-id');
+        if (!videoId) return null;
+        var current = attr(main, 'data-series-id'), items = [], re = /<li\b[^>]*\sdata-play-url="[^"]*"[^>]*>/g, m;
+        while ((m = re.exec(html))) {
+            items.push({
+                sid: attr(m[0], 'data-series-id'),
+                enc: attr(m[0], 'data-play-url'),
+                active: /\sclass="(?:[^"]*\s)?active(?:\s[^"]*)?"/.test(m[0])
+            });
+        }
+        var item = items.filter(function (it) { return current && it.sid === current; })[0] ||
+            items.filter(function (it) { return it.active; })[0] || items[0];
+        if (!item || !item.enc) return null;
+        return {videoId: videoId, seriesId: item.sid || current, enc: item.enc};
+    }
+
+    // detail-play.js getSecureKey
+    function secureKey(code) {
+        var body = JSON.parse(request(SITE + '/allocate/secure_key', {headers: xhrHeaders(code)}) || '{}');
+        if (body.code !== 0 || !body.data) throw new Error('secure_key refused: ' + body.msg);
+        return xxteaDecrypt(body.data);
+    }
+
+    // 解出某一集的 HLS 播放清單網址與播放時要帶的標頭；拿不到回傳 null
+    function resolve(url) {
+        var src = episodeSource(get(abs(url)));
+        if (!src) return null;
+        var path = xxteaDecrypt(src.enc).split('?t=')[0];
+        if (path.indexOf('/allocate/') < 0) return null;
+        var code = browserCode();
+        var key = secureKey(code);
+        // 播放器送出的開播回報；不送也能拿到完整清單，失敗不影響播放
+        try {
+            request(SITE + '/video/check_play_status', {
+                method: 'POST',
+                headers: Object.assign({'Content-Type': 'application/json'}, xhrHeaders(code)),
+                body: {videoId: src.videoId, id: src.seriesId, sessionId: key}
+            });
+        } catch (e) {
+        }
+        return {
+            url: SITE + path + '?t=' + encodeURIComponent(key) + '&vId=' + src.videoId,
+            // hls.js 取清單時只帶 cookie；分段在公開 CDN 上，不能帶 Referer (舊 CDN 有防盜鏈)
+            header: {'User-Agent': UA, 'Cookie': 'browser-code-v1=' + code}
+        };
+    }
+
+    // 先自行解密取得播放清單直連；解不出來時退回交給 App 嗅探播放頁
     function play(url) {
+        try {
+            var real = resolve(url);
+            if (real) return {parse: 0, jx: 0, url: real.url, header: JSON.stringify(real.header)};
+        } catch (e) {
+            log('粵漫之家 解密取片失敗，改用嗅探: ' + e.message);
+        }
         return {parse: 1, jx: 0, url: url};
     }
 
@@ -302,6 +512,7 @@ var rule = {
     filter: YM_FILTER,
     play_parse: true,
     lazy: 'js:' + YM_LIB + 'input = YM.play(input);',
+    // 嗅探只是後備：lazy 解不出直連時才回傳播放頁 (parse: 1) 交給 App 嗅探。
     // 播放頁一載入，站方播放器就會自己請求 HLS 清單 /allocate/playlist/…，但這個網址沒有
     // .m3u8 副檔名，只認副檔名的預設嗅探抓不到 (.ts 分段要按下播放才會出現)，
     // 所以開啟輔助嗅探，直接指出哪個請求是影片。
