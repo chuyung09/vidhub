@@ -269,7 +269,7 @@ var TVB = (function () {
             vod_director: '',
             // hero 裡的簡介被截斷，完整版在下方的 About 區塊
             vod_content: text(inner(html, 'AboutSection', 'synopsis')) || text(inner(hero, 'SeriesHero', 'synopsis')),
-            vod_play_from: 'TVB 粵語$$$TVB 多聲道',
+            vod_play_from: 'MP4$$$HLS 多聲道',
             vod_play_url: plays.length ? plays.join('#') + '$$$' + plays.join(HLS_MARK + '#') + HLS_MARK : ''
         };
     }
