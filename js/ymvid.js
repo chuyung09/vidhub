@@ -7,7 +7,8 @@
  *   列表  /hk/list/{頁}/c{語言}-s{狀態}-v{版本}-l{字母}-t{題材}-y{年份}/{排序}
  *   搜尋  /hk/search?keyword=關鍵字&p=頁，只取 .search-list 裡的 .item-row
  *   詳情  /hk/play/{id} 的 .media-info、.type-row、.intro-detail 與 .play-list 選集
- *   播放  不在這裡解析影片來源，回傳播放頁網址交給 App 嗅探 (parse: 1)
+ *   播放  不在這裡解析影片來源，回傳播放頁網址交給 App 嗅探 (parse: 1)；
+ *         以 sniffer / isVideo 告訴 App 播放頁發出的哪個請求是 HLS 清單
  *
  * 來源站對訪客只開放列表與搜尋的第 1–4 頁，第 5 頁起會被導去登入頁 (此時回傳空列表)。
  * 想看更後面的內容請用篩選 (年份／題材／字母) 把範圍縮小。
@@ -301,6 +302,11 @@ var rule = {
     filter: YM_FILTER,
     play_parse: true,
     lazy: 'js:' + YM_LIB + 'input = YM.play(input);',
+    // 播放頁一載入，站方播放器就會自己請求 HLS 清單 /allocate/playlist/…，但這個網址沒有
+    // .m3u8 副檔名，只認副檔名的預設嗅探抓不到 (.ts 分段要按下播放才會出現)，
+    // 所以開啟輔助嗅探，直接指出哪個請求是影片。
+    sniffer: 1,
+    isVideo: 'js:input = /\\/allocate\\/playlist\\/|\\.m3u8(\\?|$)/.test(input);',
     limit: 6,
     double: false,
     推荐: 'js:' + YM_LIB + 'setResult(YM.home());',
