@@ -13,8 +13,8 @@ var rule = {
 	quickSearch:0,
 	headers:{'User-Agent': 'PC_UA'},
 	timeout:5000,
-    class_name:'連載中&2023&2022&2021&2020&2019&2018&更早',
-    class_url:'連載中&2023&2022&2021&2020&2019&2018&2017',
+    class_name:'連載中&2026&2025&2024&2023&2022&2021&2020&2019&2018&更早',
+    class_url:'連載中&2026&2025&2024&2023&2022&2021&2020&2019&2018&2017',
 	play_parse:true,
 	lazy:`js:
 		var apiurl = 'https://v.anime1.me/api';
@@ -27,15 +27,15 @@ var rule = {
 			withHeaders: true
 		});
 		let json = JSON.parse(html);
-		print(json);
-		log(Object.keys(json));
-		let setCk = Object.keys(json).filter(it => it.toLowerCase() === "set-cookie");
+		let setCk = Object.keys(json).find(it => it.toLowerCase() === "set-cookie");
 		let cookie = setCk ? json[setCk] : "";
 		// 3个set-Cookie
 		if (Array.isArray(cookie)) {
 			cookie = cookie.join(';');
 		}
-		cookie = cookie.split(';').filter(function(it) {
+		cookie = String(cookie || '').split(/[;,\\n]/).map(function(it) {
+			return it.trim();
+		}).filter(function(it) {
 			return ['e', 'p', 'h'].includes(it.split('=')[0])
 		}).join(';');
 		log(cookie);
@@ -61,10 +61,10 @@ var rule = {
 			return src.replace(/<\\/?[^>]+(>|$)/g, '').replace(/&.{1,5};/g, '').replace(/\\s{2,}/g, ' ');
 		}
 		var timestamp = new Date().getTime();
-		var json = request('https://d1zquzjgwo9yb.cloudfront.net/?_=' + timestamp);
+		var json = request(HOST + '/animelist.json?_=' + timestamp);
 		var list = JSON.parse(json);
 		let playKeys = Object.values(list).filter(function(x) {
-			return x[2].includes('連載中');
+			return x[0] && String(x[2]).includes('連載中');
 		});
 		playKeys.forEach(function(it) {
 			d.push({
@@ -82,12 +82,17 @@ var rule = {
 			return src.replace(/<\\/?[^>]+(>|$)/g, '').replace(/&.{1,5};/g, '').replace(/\\s{2,}/g, ' ');
 		}
 		var timestamp = new Date().getTime();
-		var json = request('https://d1zquzjgwo9yb.cloudfront.net/?_=' + timestamp);
+		// 整份列表一次回傳,第2頁起回空避免重複
+		var json = MY_PAGE > 1 ? '[]' : request(HOST + '/animelist.json?_=' + timestamp);
 		var list = JSON.parse(json);
 		let playKeys = Object.values(list).filter(function(x) {
-			if (MY_CATE === '連載中') return x[2].includes(MY_CATE);
-			else if (MY_CATE === '2017') return x[3] <= MY_CATE;
-			else return x[3] == MY_CATE;
+			// id 為 0 的是外站連結,無法在本站播放
+			if (!x[0]) return false;
+			var year = String(x[3]);
+			if (MY_CATE === '連載中') return String(x[2]).includes(MY_CATE);
+			else if (MY_CATE === '2017') return parseInt(year) <= 2017;
+			// 跨年番的年份格式為 2023/2024
+			else return year.split('/').includes(MY_CATE);
 		});
 		playKeys.forEach(function(it) {
 			d.push({
@@ -103,12 +108,12 @@ var rule = {
 		pdfh = jsp.pdfh; pdfa = jsp.pdfa; pd = jsp.pd;
 		var html = request(input);
 		var timestamp = new Date().getTime();
-		var json = request('https://d1zquzjgwo9yb.cloudfront.net/?_=' + timestamp);
+		var json = request(HOST + '/animelist.json?_=' + timestamp);
 		var list = JSON.parse(json);
 		var vid = input.split('=')[1];
 		let playKeys = Object.values(list).find(function(x) {
 			return x[0] === parseInt(vid);
-		});
+		}) || [parseInt(vid), pdfh(html, '.page-title&&Text'), '', '', '', ''];
 		VOD = {
 			vod_pic: 'https://sta.anicdn.com/playerImg/8.jpg',
 			vod_id: playKeys[0],
@@ -149,13 +154,12 @@ var rule = {
 			return src.replace(/<\\/?[^>]+(>|$)/g, '').replace(/&.{1,5};/g, '').replace(/\\s{2,}/g, ' ');
 		}
 		var timestamp = new Date().getTime();
-		var json = request('https://d1zquzjgwo9yb.cloudfront.net/?_=' + timestamp);
+		var json = MY_PAGE > 1 ? '[]' : request(HOST + '/animelist.json?_=' + timestamp);
 		var list = JSON.parse(json);
-		var wd = input.split('=')[1];
+		var wd = (typeof KEY !== 'undefined' && KEY ? KEY : decodeURIComponent(input.split('=')[1])).toLowerCase();
 		let playKeys = Object.values(list).filter(function(x) {
-			return x[1].includes(wd);
+			return x[0] && String(x[1]).toLowerCase().includes(wd);
 		});
-		log(playKeys);
 		playKeys.forEach(function(it) {
 			d.push({
 				title: stripHtmlTag(it[1]),
