@@ -8,8 +8,9 @@
  *   搜尋  /hk/search?keyword=關鍵字&p=頁，只取 .search-list 裡的 .item-row
  *   詳情  /hk/play/{id} 的 .media-info、.type-row、.intro-detail 與 .play-list 選集
  *   播放  與 canton-anime 的 ymvid.py 相同的 XXTEA 解密：解開選集的 data-play-url、
- *         取 /allocate/secure_key 並取回 HLS 清單 (清單網址只能用一次)，
- *         經 drpy 本地代理 (proxy_rule) 交給播放器 (parse: 0)；
+ *         取 /allocate/secure_key 組出 HLS 清單網址 (只能用一次)。有 drpy 本地代理的
+ *         App 先取回清單、經 proxy_rule 交給播放器；沒有的 (DMPlayer) 直接交出網址
+ *         與 Browser-Code 標頭，由 App 自己的代理取用 (parse: 0)；
  *         解不出來時才退回播放頁網址交給 App 嗅探 (parse: 1，sniffer / isVideo)
  *
  * 來源站對訪客只開放列表與搜尋的第 1–4 頁，第 5 頁起會被導去登入頁 (此時回傳空列表)。
@@ -423,33 +424,42 @@ var YM = (function () {
         }).join('\n');
     }
 
+    // 某一集這次的一次性播放清單網址與 browser code；拿不到回傳 null
+    function locate(url) {
+        var src = episodeSource(get(url));
+        if (!src) return null;
+        var path = xxteaDecrypt(src.enc).split('?t=')[0];
+        if (path.indexOf('/allocate/') < 0) return null;
+        var code = browserCode();
+        var key = secureKey(code);
+        return {src: src, code: code, key: key, list: SITE + path + '?t=' + encodeURIComponent(key) + '&vId=' + src.videoId};
+    }
+
+    // 播放器開播時的回報；不送也能拿到完整清單，失敗不影響播放
+    function reportPlay(loc) {
+        try {
+            request(SITE + '/video/check_play_status', {
+                method: 'POST',
+                headers: Object.assign({'Content-Type': 'application/json'}, xhrHeaders(loc.code)),
+                body: {videoId: loc.src.videoId, id: loc.src.seriesId, sessionId: loc.key}
+            });
+        } catch (e) {
+        }
+    }
+
     // 某一集的 HLS 清單內容 (scraper.py fetch_m3u8)；拿不到回傳空字串
     function manifest(url) {
         url = abs(url);
         var hit = CACHE[url];
         if (hit && hit.exp > Date.now()) return hit.text;
 
-        var src = episodeSource(get(url));
-        if (!src) return '';
-        var path = xxteaDecrypt(src.enc).split('?t=')[0];
-        if (path.indexOf('/allocate/') < 0) return '';
-        var code = browserCode();
-        var key = secureKey(code);
-        var list = SITE + path + '?t=' + encodeURIComponent(key) + '&vId=' + src.videoId;
+        var loc = locate(url);
+        if (!loc) return '';
         // hls.js 取清單時只帶 cookie
-        var text = request(list, {headers: {'User-Agent': UA, 'Referer': url, 'Cookie': 'browser-code-v1=' + code}}) || '';
+        var text = request(loc.list, {headers: {'User-Agent': UA, 'Referer': url, 'Cookie': 'browser-code-v1=' + loc.code}}) || '';
         if (!/^\s*#EXTM3U/.test(text)) return '';
-        text = absolutize(text, list);
-
-        // 播放器開播後的回報；不送也能拿到完整清單，失敗不影響播放
-        try {
-            request(SITE + '/video/check_play_status', {
-                method: 'POST',
-                headers: Object.assign({'Content-Type': 'application/json'}, xhrHeaders(code)),
-                body: {videoId: src.videoId, id: src.seriesId, sessionId: key}
-            });
-        } catch (e) {
-        }
+        text = absolutize(text, loc.list);
+        reportPlay(loc);
 
         Object.keys(CACHE).forEach(function (k) {
             if (CACHE[k].exp <= Date.now()) delete CACHE[k];
@@ -458,18 +468,42 @@ var YM = (function () {
         return text;
     }
 
-    // 解得出清單就交給播放器本地代理網址；解不出來時退回交給 App 嗅探播放頁
+    // 有 drpy 本地代理的 App (TVBox 系，會提供 getProxy)：先取回清單內容，交給本地代理網址。
+    function viaLocalProxy(url) {
+        if (!manifest(url)) return null;
+        return {
+            parse: 0,
+            jx: 0,
+            // 結尾的 .m3u8 讓只看網址判斷格式的播放器把它當 HLS
+            url: getProxyUrl() + '&url=' + encodeURIComponent(abs(url)) + '&ext=.m3u8',
+            format: 'application/x-mpegURL'
+        };
+    }
+
+    // 沒有 drpy 本地代理的 App (例如 DMPlayer)：直接交出一次性清單網址，這裡不能先取，
+    // 否則網址就用掉了。
+    //   - 結尾的 #.m3u8 只是格式提示：播放器看網址就知道是 HLS，不會先發探測請求
+    //     (Range／HEAD 也會把網址用掉)；# 之後的部分不會送到伺服器。
+    //   - Browser-Code 標頭單獨就能通過驗證；它也是 AVPlayer 無法自行設定的標頭，
+    //     DMPlayer 會因此改走自己的本機代理，以 index.m3u8 / HLS MIME 交給 AVPlayer。
+    //   - 不帶 Referer：分段在公開 CDN 上 (舊 CDN 有 Referer 防盜鏈)。
+    function direct(url) {
+        var loc = locate(abs(url));
+        if (!loc) return null;
+        reportPlay(loc);
+        return {
+            parse: 0,
+            jx: 0,
+            url: loc.list + '#.m3u8',
+            header: JSON.stringify({'User-Agent': UA, 'Browser-Code': loc.code, 'Cookie': 'browser-code-v1=' + loc.code})
+        };
+    }
+
+    // 解不出來時退回交給 App 嗅探播放頁
     function play(url) {
         try {
-            if (manifest(url)) {
-                return {
-                    parse: 0,
-                    jx: 0,
-                    // 結尾的 .m3u8 讓只看網址判斷格式的播放器把它當 HLS
-                    url: getProxyUrl() + '&url=' + encodeURIComponent(abs(url)) + '&ext=.m3u8',
-                    format: 'application/x-mpegURL'
-                };
-            }
+            var out = typeof getProxy === 'function' ? viaLocalProxy(url) : direct(url);
+            if (out) return out;
         } catch (e) {
             log('粵漫之家 解密取片失敗，改用嗅探: ' + e.message);
         }
